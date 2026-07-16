@@ -6,6 +6,34 @@ import type { GeometryType, GeoObjectProperties } from '@/types';
 
 const LOTE_INSERT = 500; // insere em lotes para não estourar payload em KMZ grandes
 
+/**
+ * Muitos KMZ (ex: Enel) não trazem os atributos em campos separados — eles vêm
+ * concatenados dentro do <description>, como HTML: "<b>ALIMENTADOR: </b>RSU01N1".
+ * Esta função extrai esses pares "Rótulo: valor" e devolve como propriedades planas,
+ * para que a busca e os campos (alimentador, subestação etc) funcionem normalmente.
+ */
+function extrairPropriedadesDaDescricao(description: unknown): Record<string, string> {
+  let texto = '';
+  if (typeof description === 'string') {
+    texto = description;
+  } else if (description && typeof description === 'object' && 'value' in (description as Record<string, unknown>)) {
+    texto = String((description as Record<string, unknown>).value ?? '');
+  } else {
+    return {};
+  }
+
+  const textoLimpo = texto.replace(/<[^>]+>/g, '\n');
+  const resultado: Record<string, string> = {};
+  const regex = /([A-Za-zÀ-ÿ0-9 ]{2,40}):\s*([^\n]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(textoLimpo)) !== null) {
+    const chave = match[1].trim();
+    const valor = match[2].trim();
+    if (chave && valor) resultado[chave] = valor;
+  }
+  return resultado;
+}
+
 export interface ProgressoImportacao {
   etapa: 'lendo' | 'convertendo' | 'enviando_storage' | 'salvando_objetos' | 'concluido' | 'erro';
   objetosProcessados: number;
@@ -74,20 +102,36 @@ export async function importarKmz(
     onProgress?.({ etapa: 'salvando_objetos', objetosProcessados: 0, totalObjetos: features.length });
 
     const linhas = features.map((feature) => {
-      const properties = (feature.properties ?? {}) as GeoObjectProperties;
-      const nomeCamada = (feature.properties as Record<string, unknown> | null)?.folder as string | undefined;
+      const propriedadesOriginais = (feature.properties ?? {}) as Record<string, unknown>;
+      const propriedadesDescricao = extrairPropriedadesDaDescricao(propriedadesOriginais.description);
+
+      // "properties" final: campos originais (exceto o blob de description) + os
+      // pares extraídos do texto da descrição, todos como valores planos (buscáveis).
+      const { description: _descricaoOriginal, ...propriedadesEscalar } = propriedadesOriginais;
+      const properties: GeoObjectProperties = {
+        ...(propriedadesEscalar as GeoObjectProperties),
+        ...propriedadesDescricao,
+      };
+
+      const nomeCamada = propriedadesOriginais.folder as string | undefined;
       const tipo = feature.geometry.type as GeometryType;
       const categoria = categorizarObjeto(nomeCamada, properties, tipo);
+
+      // código do equipamento: usa CSI/código explícito se existir; senão, usa o
+      // <name> do KML (padrão comum em KMZ da Enel: TRL9801, RSU01N1 etc).
+      const codigoExplicito = extrairCampo(properties, ['csi', 'codigo', 'código']);
+      const nome = typeof propriedadesOriginais.name === 'string' ? propriedadesOriginais.name : null;
+      const codigo = codigoExplicito || nome;
 
       return {
         kmz_id: kmzId,
         tipo,
         geometry: feature.geometry,
         properties,
-        codigo: extrairCampo(properties, ['csi', 'codigo', 'código', 'id']),
+        codigo,
         municipio: extrairCampo(properties, ['municipio', 'município', 'cidade']),
         alimentador: extrairCampo(properties, ['alimentador']),
-        subestacao: extrairCampo(properties, ['subestacao', 'subestação']),
+        subestacao: extrairCampo(properties, ['subestacao', 'subestação', 'conjunto']),
         regional: extrairCampo(properties, ['regional']),
         categoria,
       };
